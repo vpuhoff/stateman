@@ -1,9 +1,10 @@
 [tool.poetry]
 name = "stateman"
-version = "1.0.5"
+version = "1.0.6"
 description = "Creating binary patch files containing changes in the directory"
 authors = ["pukhov-vi <vipukhov@sberbank.ru>"]
 license = "MIT"
+readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.6"
