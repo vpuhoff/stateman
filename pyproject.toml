@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "stateman"
-version = "1.0.4"
+version = "1.0.5"
 description = "Creating binary patch files containing changes in the directory"
 authors = ["pukhov-vi <vipukhov@sberbank.ru>"]
 license = "MIT"
