@@ -65,4 +65,4 @@ ApplyPatch(target_dir, patch_file, exclude = r'.git'+os.path.sep)
 * [https://github.com/vpuhoff/stateman](https://github.com/vpuhoff/stateman)
 
 ## Travis CI Deploys:
-* [https://travis-ci.com/vpuhoff/patchgen](https://travis-ci.com/vpuhoff/stateman) [![Build Status](https://travis-ci.com/vpuhoff/patchgen.svg?branch=master)](https://travis-ci.com/vpuhoff/stateman)
+* [https://travis-ci.com/vpuhoff/patchgen](https://travis-ci.com/vpuhoff/patchgen) [![Build Status](https://travis-ci.com/vpuhoff/patchgen.svg?branch=master)](https://travis-ci.com/vpuhoff/patchgen)
