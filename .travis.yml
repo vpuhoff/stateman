@@ -15,7 +15,7 @@ deploy:
     script: poetry publish --username $PYPI_USER --password $PYPI_PASS
     on:
       branch: master
-      all_branches: true
+      tags: true
       python: 3.6
 notifications:
   email:
