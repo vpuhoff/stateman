@@ -10,39 +10,19 @@ def write_file(filename, text):
 def setup_module(module):
     if os.path.exists(".tmp"):
         shutil.rmtree(".tmp")
-    os.makedirs(".tmp")
-    root_dir = os.path.abspath(".tmp")
-    subfolder = os.path.join(root_dir,"subfolder")
-    os.makedirs(subfolder)
-    write_file(os.path.join(subfolder,"testfile1.txt"), "test1")
-    write_file(os.path.join(subfolder,"testfile2.txt"), "test2")
-    write_file(os.path.join(root_dir,"testfile3.txt"), "test3")
-    write_file(os.path.join(root_dir,"testfile4.txt"), "test4")
-    assert os.path.exists(root_dir)
+    if os.path.exists(".tmp2"):
+        shutil.rmtree(".tmp2")
+    if os.path.isfile("new.patch"):
+        os.remove("new.patch")
 
 def teardown_module(module):
     if os.path.exists(".tmp"):
         shutil.rmtree(".tmp")
+    if os.path.exists(".tmp2"):
+        shutil.rmtree(".tmp2")
     if os.path.isfile("new.patch"):
         os.remove("new.patch")
 
 
 def test_all(local):
-    root_dir = os.path.abspath(".tmp")
-    subfolder = os.path.join(root_dir,"subfolder")
-    patch_file="new.patch"
-    state1 = GetState(root_dir)
-    os.remove(os.path.join(subfolder,"testfile2.txt"))
-    os.remove(os.path.join(root_dir,"testfile4.txt"))
-    write_file(os.path.join(subfolder,"testfile2.txt"), "changed")
-    state2 = GetState(root_dir)
-    diff = GetDiff(state1, state2)
-    CreatePatch(root_dir, patch_file, diff)  
-
-    write_file(os.path.join(subfolder,"testfile1.txt"), "test1")
-    write_file(os.path.join(subfolder,"testfile2.txt"), "test2")
-    write_file(os.path.join(root_dir,"testfile3.txt"), "test3")
-    write_file(os.path.join(root_dir,"testfile4.txt"), "test4")
-    
-    ApplyPatch(root_dir, patch_file)
-    
+    import example

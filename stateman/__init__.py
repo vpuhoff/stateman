@@ -4,7 +4,6 @@ from pathlib import Path
 import hashlib
 import json
 import os
-
 sep = os.path.sep
 
 def get_hash(filename):
@@ -14,16 +13,21 @@ def get_hash(filename):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
-def find_files(folder):
+def find_files(folder, exclude=None):
     if folder[-1]!=os.path.sep:
         folder+=os.path.sep
     for root, dirs, files in os.walk(folder):
         for file in files:
             filename = os.path.join(root, file)
-            yield filename.replace(folder,'').replace("\\",'/'),get_hash(filename)
+            if exclude:
+                if not exclude in filename:
+                    yield filename.replace(folder,'').replace("\\",'/'),get_hash(filename)
+            else:
+                yield filename.replace(folder,'').replace("\\",'/'),get_hash(filename)
+                
 
-def GetState(folder):
-    return dict(find_files(folder))
+def GetState(folder,exclude=None):
+    return dict(find_files(folder, exclude))
                            
 def GetStateHash(state):
     hashid = hashlib.md5()
@@ -80,14 +84,14 @@ def CheckGitRepo(target):
         raise Exception(data[0].decode()+"\n"+data[1].decode())
     return True
 
-def ApplyPatch(target, patch_file):
+def ApplyPatch(target, patch_file, exclude=None):
     with ZipFile(patch_file, "r") as patch:
         with patch.open('metadata.json','r') as metadata:
             diff = json.loads(metadata.read())
         print("Removed: ", len(diff['removed']))
         print("Added: ", len(diff['added']))
         print("Changed: ", len(diff['changed']))
-        current_state = GetState(target)
+        current_state = GetState(target, exclude)
         state_hash = GetStateHash(current_state)
         print(f"Current state: {state_hash}")
         print(f"Source state: {diff['source_state']}")
@@ -98,6 +102,7 @@ def ApplyPatch(target, patch_file):
             return True
         else:
             if diff['source_state'] != state_hash:
+                print(diff)
                 raise Exception("The current state does not match the patch")
             else:
                 for filename in diff['removed']:
