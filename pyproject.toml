@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "stateman"
+version = "1.0.0"
+description = "Creating binary patch files containing changes in the directory"
+authors = ["pukhov-vi <vipukhov@sberbank.ru>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.6"
+
+[tool.poetry.dev-dependencies]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+APPLICATION-NAME = 'entry:main'
