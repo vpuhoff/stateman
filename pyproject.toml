@@ -1,25 +1,12 @@
-[tool.poetry]
+[project]
 name = "stateman"
-version = "1.3.0"
-description = "This module provides tools to track changes in the content of a directory and create compact binary "patches" that can be used to synchronize another copy of that directory."
-authors =  [
+version = "1.3.0" # Убедитесь, что версия актуальна
+description = "This module provides tools to track changes in the content of a directory and create compact binary patches that can be used to synchronize another copy of that directory."
+readme = "README.md"
+license = { text = "MIT" } 
+authors = [
     { name = "vpuhoff", email = "vpuhoff@live.ru" }
 ]
-license = "MIT"
-readme = "README.md"
-
-[tool.poetry.dependencies]
-python = "^3.10"
-
-[tool.poetry.dev-dependencies]
-
-[build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
-
-[tool.poetry.scripts]
-APPLICATION-NAME = 'entry:main'
-
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -29,3 +16,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Utilities",
 ]
+dependencies = [] 
+
+[project.scripts]
+keylocker = "entry:main"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
