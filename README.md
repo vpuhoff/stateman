@@ -1,4 +1,6 @@
 # Stateman: Directory Binary Patching Utility
+[![PyPI Downloads](https://img.shields.io/pypi/dm/stateman)](https://pypi.org/project/stateman/) [![Downloads](https://static.pepy.tech/badge/stateman)](https://pepy.tech/project/stateman)
+
 
 This module provides tools to track changes in the content of a directory and create compact binary "patches" that can be used to synchronize another copy of that directory.
 
@@ -26,6 +28,10 @@ The basic workflow is:
 2.  **`GetDiff(state1, state2)`**: Compares two such "snapshots" and returns a dictionary describing the difference: lists of added, removed, changed files, and the hashes of the source and target states.
 3.  **`CreatePatch(source_folder, patch_file, difference)`**: Takes the difference dictionary (`diff`) and the files from `source_folder` that were added or changed, and packages them along with metadata into a ZIP archive (`patch_file`).
 4.  **`ApplyPatch(target_folder, patch_file)`**: Unpacks the `patch_file`. First, it checks if the current state of `target_folder` matches the *source* state hash from the patch. If yes, it deletes files marked as removed and extracts/overwrites files from the archive. After applying, the state of `target_folder` should match the *target* state hash from the patch.
+
+* Wiki: [https://deepwiki.com/vpuhoff/stateman](https://deepwiki.com/vpuhoff/stateman/1-overview)
+
+![Alt](https://repobeats.axiom.co/api/embed/f5781b0c7b823dcf233cfcdd37ae992cdc054ae5.svg "Repobeats analytics image")
 
 ## Usage Example:
 
