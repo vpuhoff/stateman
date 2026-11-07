@@ -10,7 +10,7 @@ Imagine you have a large directory with files (e.g., installed software, game as
 
 `stateman` solves this problem by allowing you to:
 
-1.  **Capture the state** of a directory at a specific point in time (list of files and their MD5 checksums).
+1.  **Capture the state** of a directory at a specific point in time (list of files and their SHA-256 checksums).
 2.  **Compare two states** (e.g., before and after an update) to determine which files were added, removed, or modified.
 3.  **Create a binary patch** (a ZIP archive) containing only the added and modified files, along with metadata about the changes.
 4.  **Apply the patch** to another copy of the directory (which is in the initial state) to bring it to the updated state.
@@ -30,6 +30,31 @@ The basic workflow is:
 4.  **`ApplyPatch(target_folder, patch_file)`**: Unpacks the `patch_file`. First, it checks if the current state of `target_folder` matches the *source* state hash from the patch. If yes, it deletes files marked as removed and extracts/overwrites files from the archive. After applying, the state of `target_folder` should match the *target* state hash from the patch.
 
 * Wiki: [https://deepwiki.com/vpuhoff/stateman](https://deepwiki.com/vpuhoff/stateman/1-overview)
+
+## Security (v2.0)
+
+Starting with v2.0, patches are safe to apply even when they come from an untrusted source:
+
+* **SHA-256** file and state hashes (v1 patches used MD5; old patches are still supported for reading).
+* **Path traversal protection** — every path from patch metadata is validated before anything touches the disk: absolute paths, backslashes, drive letters and `..` components are rejected (`UnsafePatchPathError`).
+* **Per-file integrity verification** — each extracted file is checked against its expected hash before proceeding.
+* **Transactional apply with rollback** — if any step fails (corrupted archive member, hash mismatch, final state mismatch), all changes are rolled back and the target directory is restored to its original state. `ApplyPatch` raises an exception instead of silently returning `True`.
+* **Compressed patches** — archives are written with `ZIP_DEFLATED` instead of stored.
+
+## Changelog
+
+### 2.0.0
+* **Breaking:** `ApplyPatch` now raises `PatchVerificationError` when the final state hash does not match the patch target state (previously it printed a warning and returned `True`), and when a file extracted from the patch fails its hash check.
+* **Breaking:** default hash algorithm switched from MD5 to SHA-256. Legacy v1 (MD5) patches are still applied correctly.
+* Path traversal protection for all paths taken from patch metadata (`UnsafePatchPathError`).
+* `ApplyPatch` is transactional: failed patches are rolled back automatically.
+* Patches are compressed with DEFLATE.
+* New exceptions: `PatchError`, `PatchVerificationError`, `UnsafePatchPathError`, `PatchFormatError`.
+* Removed the unused `CheckGitRepo` helper and the stray `keylocker` console script from `pyproject.toml`.
+* CI matrix: Linux + Windows, Python 3.9–3.13.
+
+### 1.3.1
+* Previous stable release.
 
 ![Alt](https://repobeats.axiom.co/api/embed/f5781b0c7b823dcf233cfcdd37ae992cdc054ae5.svg "Repobeats analytics image")
 

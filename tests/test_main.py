@@ -1,9 +1,14 @@
 import pytest
-from stateman import GetState, GetDiff, CreatePatch, ApplyPatch, GetStateHash, get_hash
+from stateman import (
+    GetState, GetDiff, CreatePatch, ApplyPatch, GetStateHash, get_hash,
+    PatchVerificationError, UnsafePatchPathError, PatchFormatError,
+)
+import json
 import os
 import shutil
+import stateman
 from pathlib import Path
-import json
+from zipfile import ZipFile
 
 # --- Helper Functions ---
 
@@ -121,8 +126,8 @@ def test_get_diff_add_remove_change(tmp_path):
     assert diff['source_state'] == state1_hash
     assert diff['target_state'] == state2_hash
     assert state1_hash != state2_hash
-    assert diff['md5']['file_add.txt'] == state2['file_add.txt']
-    assert diff['md5']['file_change.txt'] == state2['file_change.txt']
+    assert diff['hashes']['file_add.txt'] == state2['file_add.txt']
+    assert diff['hashes']['file_change.txt'] == state2['file_change.txt']
 
 def test_patch_apply_simple(tmp_path):
     """Тестирует полный цикл CreatePatch и ApplyPatch для простых изменений."""
@@ -246,3 +251,166 @@ def test_apply_patch_already_applied(tmp_path):
     target_state_after = GetState(str(target_dir))
     assert GetStateHash(target_state_after) == state2_hash
     assert target_state_after == target_state_before
+
+# --- v2.0 tests: security & reliability ---
+
+def _rewrite_metadata(patch_file, mutate):
+    """Читает патч, изменяет metadata.json и пересобирает архив."""
+    with ZipFile(patch_file) as z:
+        data = {n: z.read(n) for n in z.namelist()}
+    diff = json.loads(data["metadata.json"])
+    diff = mutate(diff)
+    data["metadata.json"] = json.dumps(diff, indent=4, ensure_ascii=False).encode("utf-8")
+    with ZipFile(patch_file, "w") as z:
+        for name, blob in data.items():
+            z.writestr(name, blob)
+
+def test_default_hash_is_sha256(tmp_path):
+    """По умолчанию используется SHA-256, а не MD5."""
+    source_dir, _, _ = setup_test_dirs(tmp_path)
+    write_file(source_dir / "file.txt", "content")
+    h = get_hash(source_dir / "file.txt")
+    assert len(h) == 64  # SHA-256 hex digest
+    assert h != get_hash(source_dir / "file.txt", algo="md5")
+
+def test_patch_is_deflated(tmp_path):
+    """Патч сжимается (ZIP_DEFLATED), а не хранится как ZIP_STORED."""
+    source_dir, target_dir, patch_file = setup_test_dirs(tmp_path)
+    write_file(source_dir / "file.txt", "content" * 100)
+    state1 = {}
+    state2 = GetState(str(source_dir))
+    diff = GetDiff(state1, state2)
+    CreatePatch(str(source_dir), str(patch_file), diff)
+    with ZipFile(patch_file) as z:
+        compress_types = {i.compress_type for i in z.infolist() if i.filename != "metadata.json"}
+    assert compress_types == {8}  # ZIP_DEFLATED
+
+def test_apply_patch_rejects_path_traversal(tmp_path):
+    """Патч с '..' в путях отклоняется до любых изменений на диске."""
+    source_dir, target_dir, patch_file = setup_test_dirs(tmp_path)
+    write_file(source_dir / "file.txt", "content")
+    state2 = GetState(str(source_dir))
+    diff = GetDiff({}, state2)
+    CreatePatch(str(source_dir), str(patch_file), diff)
+
+    def add_traversal(d):
+        d["added"] = d["added"] + ["../evil.txt"]
+        return d
+
+    _rewrite_metadata(patch_file, add_traversal)
+    with pytest.raises(UnsafePatchPathError):
+        ApplyPatch(str(target_dir), str(patch_file))
+
+def test_apply_patch_rejects_absolute_path_in_removal(tmp_path):
+    """Абсолютный путь в списке удалений отклоняется."""
+    source_dir, target_dir, patch_file = setup_test_dirs(tmp_path)
+    write_file(source_dir / "file.txt", "content")
+    state2 = GetState(str(source_dir))
+    diff = GetDiff({}, state2)
+    CreatePatch(str(source_dir), str(patch_file), diff)
+
+    def abs_removal(d):
+        d["removed"] = ["/etc/passwd"]
+        return d
+
+    _rewrite_metadata(patch_file, abs_removal)
+    with pytest.raises(UnsafePatchPathError):
+        ApplyPatch(str(target_dir), str(patch_file))
+
+def test_corrupted_patch_rolls_back(tmp_path):
+    """Повреждённый файл в патче: ошибка + полный откат к исходному состоянию."""
+    source_dir, target_dir, patch_file = setup_test_dirs(tmp_path)
+    write_file(source_dir / "keep.txt", "keep")
+    write_file(source_dir / "change.txt", "original")
+    state1 = GetState(str(source_dir))
+    shutil.copytree(str(source_dir), str(target_dir), dirs_exist_ok=True)
+
+    write_file(source_dir / "change.txt", "tampered content")
+    state2 = GetState(str(source_dir))
+    diff = GetDiff(state1, state2)
+    CreatePatch(str(source_dir), str(patch_file), diff)
+
+    # Подменяем содержимое change.txt внутри патча
+    with ZipFile(patch_file) as z:
+        data = {n: z.read(n) for n in z.namelist()}
+    data["change.txt"] = b"corrupted bytes"
+    with ZipFile(patch_file, "w") as z:
+        for name, blob in data.items():
+            z.writestr(name, blob)
+
+    with pytest.raises(PatchVerificationError):
+        ApplyPatch(str(target_dir), str(patch_file))
+
+    # Каталог должен остаться в исходном состоянии (откат сработал)
+    assert (target_dir / "keep.txt").read_text() == "keep"
+    assert (target_dir / "change.txt").read_text() == "original"
+
+def test_final_state_mismatch_rolls_back(tmp_path):
+    """Несовпадение итогового хеша: исключение и откат, а не молчаливый True."""
+    source_dir, target_dir, patch_file = setup_test_dirs(tmp_path)
+    write_file(source_dir / "change.txt", "original")
+    state1 = GetState(str(source_dir))
+    shutil.copytree(str(source_dir), str(target_dir), dirs_exist_ok=True)
+
+    write_file(source_dir / "change.txt", "changed")
+    state2 = GetState(str(source_dir))
+    diff = GetDiff(state1, state2)
+    CreatePatch(str(source_dir), str(patch_file), diff)
+
+    def break_target(d):
+        d["target_state"] = "0" * 64
+        return d
+
+    _rewrite_metadata(patch_file, break_target)
+
+    with pytest.raises(PatchVerificationError, match="Final state hash"):
+        ApplyPatch(str(target_dir), str(patch_file))
+
+    # Откат: файл восстановлен из бэкапа
+    assert (target_dir / "change.txt").read_text() == "original"
+
+def test_legacy_md5_patch_still_applies(tmp_path):
+    """Патч старого формата (v1, MD5, ключ 'md5') по-прежнему применяется."""
+    source_dir, target_dir, patch_file = setup_test_dirs(tmp_path)
+    write_file(source_dir / "file.txt", "v1 original")
+    state1 = GetState(str(source_dir), algo="md5")
+    shutil.copytree(str(source_dir), str(target_dir), dirs_exist_ok=True)
+
+    write_file(source_dir / "file.txt", "v1 changed")
+    state2 = GetState(str(source_dir), algo="md5")
+    diff = GetDiff(state1, state2, algo="md5")
+    CreatePatch(str(source_dir), str(patch_file), diff)
+
+    # Приводим метаданные к формату v1: без 'hash_algo', ключ 'md5'
+    def to_v1(d):
+        d["md5"] = d.pop("hashes")
+        d.pop("hash_algo", None)
+        return d
+
+    _rewrite_metadata(patch_file, to_v1)
+
+    assert ApplyPatch(str(target_dir), str(patch_file)) is True
+    assert (target_dir / "file.txt").read_text() == "v1 changed"
+
+def test_invalid_patch_formats(tmp_path):
+    """Некорректные патчи дают PatchFormatError, а не падение с трейсбеком zipfile."""
+    source_dir, target_dir, patch_file = setup_test_dirs(tmp_path)
+
+    # Не ZIP вообще
+    patch_file.write_bytes(b"this is not a zip")
+    with pytest.raises(PatchFormatError):
+        ApplyPatch(str(target_dir), str(patch_file))
+
+    # ZIP без metadata.json
+    other = tmp_path / "no_meta.zip"
+    with ZipFile(other, "w") as z:
+        z.writestr("some_file.txt", "data")
+    with pytest.raises(PatchFormatError):
+        ApplyPatch(str(target_dir), str(other))
+
+def test_create_patch_missing_file(tmp_path):
+    """CreatePatch падает явно, если файла из diff нет в источнике."""
+    source_dir, _, patch_file = setup_test_dirs(tmp_path)
+    diff = {"added": ["ghost.txt"], "changed": [], "removed": []}
+    with pytest.raises(Exception, match="ghost.txt"):
+        CreatePatch(str(source_dir), str(patch_file), diff)

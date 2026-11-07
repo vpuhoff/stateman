@@ -1,40 +1,64 @@
 import hashlib
 import json
 import os
-import shutil # Imported but not used directly in this file? Maybe needed for tests or example.
+import shutil
+import tempfile
 from collections import OrderedDict
-from pathlib import Path
-from zipfile import ZipFile
-from subprocess import Popen, PIPE # Used only in CheckGitRepo
+from pathlib import Path, PurePosixPath
+from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
+
+# Hash algorithm used for new patches. Old (v1) patches used MD5 and are
+# still readable by ApplyPatch via the legacy "md5" metadata format.
+DEFAULT_HASH_ALGO = "sha256"
+SUPPORTED_HASH_ALGOS = ("sha256", "md5")
+
+# Size of chunks used when hashing / copying files.
+_CHUNK_SIZE = 64 * 1024
 
 # Define the path separator for the current OS for unification
 sep = os.path.sep
 
-def get_hash(filename):
-    """Calculates the MD5 hash of a file.
+
+class PatchError(Exception):
+    """Base class for all stateman patch errors."""
+
+
+class UnsafePatchPathError(PatchError):
+    """A path contained in patch metadata is unsafe (escapes the target directory)."""
+
+
+class PatchVerificationError(PatchError):
+    """Patch content or the resulting state failed an integrity check."""
+
+
+class PatchFormatError(PatchError):
+    """The patch file is not a valid stateman patch."""
+
+
+def get_hash(filename, algo=DEFAULT_HASH_ALGO):
+    """Calculates the hash of a file.
 
     Reads the file in chunks for efficient handling of large files.
 
     Args:
         filename (str): Path to the file.
+        algo (str): Hash algorithm name, e.g. "sha256" (default) or "md5".
 
     Returns:
-        str: The MD5 hash of the file as a hexadecimal string. Returns None if the file is not found.
+        str: The hex digest of the file, or None if the file could not be read.
     """
-    hash_md5 = hashlib.md5()
+    hasher = hashlib.new(algo)
     try:
         with open(filename, "rb") as f:
-            # Read the file in 4096-byte blocks
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-    except FileNotFoundError:
-        # Handle the case where the file is not found (e.g., deleted between steps)
-        # Can return None, an empty string, or raise an exception depending on the logic
-        print(f"Warning: File not found during hashing: {filename}")
-        return None # Or another default value
-    return hash_md5.hexdigest()
+            for chunk in iter(lambda: f.read(_CHUNK_SIZE), b""):
+                hasher.update(chunk)
+    except OSError:
+        # File disappeared or is unreadable between steps
+        return None
+    return hasher.hexdigest()
 
-def find_files(folder, exclude=None):
+
+def find_files(folder, exclude=None, algo=DEFAULT_HASH_ALGO):
     """Recursively finds all files in a directory and calculates their hashes.
 
     Ignores files/directories whose path contains the `exclude` string.
@@ -42,152 +66,120 @@ def find_files(folder, exclude=None):
 
     Args:
         folder (str): The root directory to search.
-        exclude (str, optional): A string (or regex pattern), paths containing it will be excluded.
-                                 Defaults to None (nothing excluded).
+        exclude (str, optional): A string, paths containing it will be excluded.
+        algo (str): Hash algorithm used for file hashes.
 
     Yields:
-        tuple: A tuple (relative_path, md5_hash) for each found file.
+        tuple: (relative_path, hash) for each found file.
                The relative path uses '/' as a separator.
     """
     if not folder.endswith(os.path.sep):
         folder += os.path.sep
 
     for root, dirs, files in os.walk(folder):
-        # Optionally: Exclude directories at the os.walk level for efficiency
         if exclude:
             dirs[:] = [d for d in dirs if exclude not in os.path.join(root, d)]
 
         for file in files:
             filename = os.path.join(root, file)
-            relative_path = filename.replace(folder, '').replace("\\", '/') # Path normalization
+            relative_path = filename.replace(folder, '').replace("\\", '/')  # Path normalization
 
-            # Check for exclusion
-            if exclude and exclude in filename: # Check the full path for exclude
-                continue # Skip the file if it matches the exclusion pattern
+            if exclude and exclude in filename:  # Check the full path for exclude
+                continue
 
-            file_hash = get_hash(filename)
-            if file_hash: # Ensure the hash was obtained (file wasn't deleted)
+            file_hash = get_hash(filename, algo)
+            if file_hash:  # Ensure the hash was obtained (file wasn't deleted)
                 yield relative_path, file_hash
 
 
-def GetState(folder, exclude=None):
+def GetState(folder, exclude=None, algo=DEFAULT_HASH_ALGO):
     """Creates a dictionary representing the state of a directory (file -> hash).
-
-    Uses find_files to get the list of files and their hashes.
 
     Args:
         folder (str): Path to the directory.
         exclude (str, optional): Pattern to exclude files/directories.
+        algo (str): Hash algorithm used for file hashes.
 
     Returns:
-        dict: A dictionary where keys are relative file paths (with '/' separator),
-              and values are their MD5 hashes.
+        dict: Relative file paths (with '/' separator) mapped to their hashes.
     """
-    return dict(find_files(folder, exclude))
+    return dict(find_files(folder, exclude, algo))
 
 
-def GetStateHash(state):
-    """Calculates a single MD5 hash for the entire directory state.
+def GetStateHash(state, algo=DEFAULT_HASH_ALGO):
+    """Calculates a single hash for the entire directory state.
 
     The hash depends on file names and their hashes. Sorting keys ensures
     the same hash for the same state, regardless of file traversal order.
 
     Args:
         state (dict): The directory state dictionary (result of GetState).
+        algo (str): Hash algorithm used for the state digest.
 
     Returns:
-        str: The overall MD5 hash of the state as a hexadecimal string.
+        str: The overall hash of the state as a hexadecimal string.
     """
-    hashid = hashlib.md5()
-    # Sort items by key (file path) for hash consistency
+    hasher = hashlib.new(algo)
     ordered = OrderedDict(sorted(state.items()))
     for k, v in ordered.items():
-        hashid.update(k.encode('utf-8')) # Encode the key (path)
-        hashid.update(v.encode('utf-8')) # Encode the value (file hash)
-    return hashid.hexdigest()
+        hasher.update(k.encode('utf-8'))
+        hasher.update(v.encode('utf-8'))
+    return hasher.hexdigest()
 
 
-def GetDiff(state1, state2):
+def GetDiff(state1, state2, algo=DEFAULT_HASH_ALGO):
     """Calculates the difference between two directory states.
-
-    Determines added, removed, and changed files.
 
     Args:
         state1 (dict): The initial state (file -> hash dictionary).
         state2 (dict): The final state (file -> hash dictionary).
+        algo (str): Hash algorithm the states were computed with. It is stored
+                    in the diff so ApplyPatch can verify states consistently.
 
     Returns:
         dict: A dictionary with difference information:
-              - 'removed': list[str] - list of removed files.
-              - 'added': list[str] - list of added files.
-              - 'changed': list[str] - list of changed files (different hashes).
+              - 'removed': list[str] - removed files.
+              - 'added': list[str] - added files.
+              - 'changed': list[str] - changed files (different hashes).
               - 'state': dict - the final state (state2).
-              - 'md5': dict - hash dictionary for added and changed files from state2.
+              - 'hashes': dict - hashes of added and changed files from state2.
+              - 'hash_algo': str - hash algorithm used.
               - 'source_state': str - hash of the initial state (state1).
               - 'target_state': str - hash of the final state (state2).
     """
     keysA = set(state1.keys())
     keysB = set(state2.keys())
 
-    removed = keysA - keysB # Files present in state1 but not in state2
+    removed = keysA - keysB  # Files present in state1 but not in state2
     added = keysB - keysA   # Files present in state2 but not in state1
-    keep = keysA.intersection(keysB) # Files present in both states
+    keep = keysA.intersection(keysB)
 
-    # Changed files are those present in both states but with different hashes
     changed = [key for key in keep if state1[key] != state2[key]]
 
     result = {
         'removed': list(removed),
         'added': list(added),
         'changed': list(changed),
-        'state': state2, # Store the final state in the diff
-        'md5': {}, # Hashes of files to be included in the patch
-        'source_state': GetStateHash(state1), # Hash of the source state
-        'target_state': GetStateHash(state2)  # Hash of the target state
+        'state': state2,  # Store the final state in the diff
+        'hashes': {},  # Hashes of files to be included in the patch
+        'hash_algo': algo,
+        'source_state': GetStateHash(state1, algo),
+        'target_state': GetStateHash(state2, algo)
     }
 
-    # Collect hashes for all files that were added or changed
     allfiles_to_include = set(changed)
     allfiles_to_include.update(added)
     for key in allfiles_to_include:
-        result['md5'][key] = state2[key] # Take the hash from the final state
+        result['hashes'][key] = state2[key]
 
     return result
-
-
-def CreatePatch(source_folder, patch_file, diff):
-    """Creates a ZIP archive (patch) containing the changes.
-
-    The patch includes metadata (diff information) and the necessary files
-    (added and changed).
-
-    Args:
-        source_folder (str): The folder from which changed and added files are taken.
-        patch_file (str): The filename for the created ZIP patch.
-        diff (dict): The difference dictionary obtained from GetDiff.
-    """
-    with ZipFile(patch_file, "w") as z:
-        # Write metadata to metadata.json inside the archive
-        z.writestr("metadata.json", data=json.dumps(diff, indent=4, ensure_ascii=False))
-
-        # Add all added files to the archive
-        for file in diff.get('added', []):
-            source_path = os.path.join(source_folder, ClearPatch(file)) # Path to the file in the source folder
-            # arcname=file ensures the relative path is preserved inside the archive
-            z.write(source_path, arcname=file)
-
-        # Add all changed files to the archive
-        for file in diff.get('changed', []):
-            source_path = os.path.join(source_folder, ClearPatch(file)) # Path to the file in the source folder
-            z.write(source_path, arcname=file)
 
 
 def ClearPatch(path):
     """Normalizes path separators to be specific to the current OS.
 
-    Converts '/' to '\' on Windows and vice versa on other systems.
-    Used to construct correct file paths when reading/writing
-    in the file system, as paths within the diff and patch are stored with '/'.
+    Converts '/' to '\\' on Windows and vice versa on other systems.
+    Paths within diffs and patches are always stored with '/'.
 
     Args:
         path (str): Path with '/' separators.
@@ -195,50 +187,92 @@ def ClearPatch(path):
     Returns:
         str: Path with separators specific to the current OS.
     """
-    if sep == "\\": # If OS is Windows
+    if sep == "\\":  # If OS is Windows
         return path.replace("/", "\\")
-    else: # For Linux, macOS, and other POSIX-compliant systems
-        return path.replace("\\", "/") # Replace backslashes just in case
+    else:
+        return path.replace("\\", "/")
 
 
-def CheckGitRepo(target):
-    """Checks the integrity of a Git repository using 'git fsck'.
+def safe_join(base, relative_path):
+    """Joins `relative_path` (from patch metadata) to `base`, safely.
 
-    This function seems specific and possibly unrelated to the core
-    patching logic. Is it used anywhere?
+    Rejects absolute paths, drive letters, backslashes, null bytes and any
+    '..' components, and verifies the resolved result stays inside `base`.
+    This prevents path-traversal attacks from untrusted patches.
 
     Args:
-        target (str): Path to the directory assumed to be a Git repository.
+        base (str): The target directory (trusted).
+        relative_path (str): The path from patch metadata (untrusted).
 
     Returns:
-        bool: True if 'git fsck' completed successfully (return code 0).
+        str: The safe absolute path of the file inside `base`.
 
     Raises:
-        Exception: If 'git fsck' failed or if the git command is not found.
+        UnsafePatchPathError: If the relative path is unsafe.
     """
+    if not relative_path or "\x00" in relative_path:
+        raise UnsafePatchPathError(f"Empty or invalid path in patch metadata: {relative_path!r}")
+    if "\\" in relative_path:
+        raise UnsafePatchPathError(f"Backslash in patch path (expected '/'): {relative_path!r}")
+
+    pure = PurePosixPath(relative_path)
+    if pure.is_absolute():
+        raise UnsafePatchPathError(f"Absolute path in patch metadata: {relative_path!r}")
+    if any(part == ".." for part in pure.parts):
+        raise UnsafePatchPathError(f"Path traversal ('..') in patch metadata: {relative_path!r}")
+
+    base_real = os.path.realpath(base)
+    full = os.path.realpath(os.path.join(base_real, *pure.parts))
+    # Belt and braces: never escape the base directory.
     try:
-        # Run 'git fsck' in the specified directory
-        process = Popen(["git", "fsck"], cwd=target, stdout=PIPE, stderr=PIPE, text=True, encoding='utf-8')
-        stdout, stderr = process.communicate()
-        code = process.wait()
-        if code != 0:
-            # If the command failed, raise an exception
-            raise Exception(f"Git fsck failed in {target}:\nSTDOUT: {stdout}\nSTDERR: {stderr}")
-        print(f"Git fsck successful in {target}")
-        return True
-    except FileNotFoundError:
-        raise Exception(f"Git command not found. Is Git installed and in PATH?")
-    except Exception as e:
-        # Catch other potential Popen errors
-        raise Exception(f"Error running git fsck in {target}: {e}")
+        inside = os.path.commonpath([base_real, full]) == base_real
+    except ValueError:  # e.g. different drives on Windows
+        inside = False
+    if not inside:
+        raise UnsafePatchPathError(f"Path escapes the target directory: {relative_path!r}")
+    return full
+
+
+def CreatePatch(source_folder, patch_file, diff):
+    """Creates a ZIP archive (patch) containing the changes.
+
+    The patch includes metadata (diff information) and the necessary files
+    (added and changed), compressed with DEFLATE.
+
+    Args:
+        source_folder (str): The folder from which changed and added files are taken.
+        patch_file (str): The filename for the created ZIP patch.
+        diff (dict): The difference dictionary obtained from GetDiff.
+
+    Raises:
+        UnsafePatchPathError: If a path in the diff escapes the source folder.
+        PatchError: If a required file is missing from the source folder.
+    """
+    with ZipFile(patch_file, "w", compression=ZIP_DEFLATED) as z:
+        z.writestr("metadata.json", data=json.dumps(diff, indent=4, ensure_ascii=False))
+
+        for file in diff.get('added', []) + diff.get('changed', []):
+            source_path = safe_join(source_folder, file)  # Also validates the path
+            if not os.path.isfile(source_path):
+                raise PatchError(f"File listed in diff not found in source folder: {file}")
+            z.write(source_path, arcname=file)
 
 
 def ApplyPatch(target, patch_file, exclude=None):
     """Applies a patch to the target directory.
 
-    Verifies that the current state of the target directory matches
-    the source state specified in the patch. Deletes, adds, and updates files
-    according to the patch metadata.
+    Verifies that the current state of the target directory matches the source
+    state specified in the patch, deletes, adds, and updates files according
+    to the patch metadata, and verifies the final state hash. Every file
+    written from the patch is checked against its expected hash.
+
+    The application is transactional: if any step fails (hash mismatch,
+    missing archive member, final state mismatch), all changes made so far
+    are rolled back and an exception is raised. The target directory is left
+    in its original state.
+
+    Supports both the current v2 patches (SHA-256, 'hashes' metadata key)
+    and legacy v1 patches (MD5, 'md5' metadata key).
 
     Args:
         target (str): Path to the target directory where the patch is applied.
@@ -252,33 +286,56 @@ def ApplyPatch(target, patch_file, exclude=None):
 
     Raises:
         FileNotFoundError: If the target directory or patch file does not exist.
-        ValueError: If the patch file is invalid (missing or corrupt metadata.json).
-        Exception: If the current state of the target directory does not match
-                   the source state required by the patch.
-        AssertionError: If the hash of an extracted file does not match the hash
-                        specified in the patch metadata (integrity check failure).
+        PatchFormatError: If the patch file is invalid (not a ZIP, missing or
+                          corrupt metadata.json, unsupported hash algorithm).
+        UnsafePatchPathError: If a path in patch metadata is unsafe.
+        PatchVerificationError: If the current state of the target directory
+                   does not match the patch source state, if an extracted file
+                   fails its hash check, or if the final state does not match
+                   the patch target state.
+        PatchError: For other fatal errors during patch application.
     """
     if not os.path.isdir(target):
         raise FileNotFoundError(f"Target directory not found: {target}")
     if not os.path.isfile(patch_file):
         raise FileNotFoundError(f"Patch file not found: {patch_file}")
 
-    with ZipFile(patch_file, "r") as patch:
+    try:
+        patch = ZipFile(patch_file, "r")
+    except BadZipFile as e:
+        raise PatchFormatError(f"Invalid patch file (not a ZIP archive): {patch_file}") from e
+
+    with patch:
         # Read metadata from the patch
         try:
             with patch.open('metadata.json', 'r') as metadata_file:
-                # Read as bytes and decode as utf-8 (more robust)
                 diff = json.loads(metadata_file.read().decode('utf-8'))
         except KeyError:
-            raise ValueError("Invalid patch file: metadata.json not found.")
-        except json.JSONDecodeError:
-             raise ValueError("Invalid patch file: metadata.json is corrupted.")
+            raise PatchFormatError("Invalid patch file: metadata.json not found.")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise PatchFormatError("Invalid patch file: metadata.json is corrupted.")
 
-        print(f"Patch contains: Removed: {len(diff.get('removed',[]))}, Added: {len(diff.get('added',[]))}, Changed: {len(diff.get('changed',[]))}")
+        algo = diff.get('hash_algo', 'md5')  # v1 patches have no 'hash_algo'
+        if algo not in SUPPORTED_HASH_ALGOS:
+            raise PatchFormatError(f"Unsupported hash algorithm in patch: {algo}")
+
+        # v2 patches use 'hashes'; v1 patches used 'md5'
+        expected_hashes = diff.get('hashes') or diff.get('md5') or {}
+
+        removed = list(diff.get('removed', []))
+        added = list(diff.get('added', []))
+        changed = list(diff.get('changed', []))
+        files_to_extract = added + changed
+
+        print(f"Patch contains: Removed: {len(removed)}, Added: {len(added)}, Changed: {len(changed)}")
+
+        # Validate every path up front, before touching the file system.
+        for filename in removed + files_to_extract:
+            safe_join(target, filename)
 
         # Get the current state of the target directory
-        current_state = GetState(target, exclude)
-        state_hash = GetStateHash(current_state)
+        current_state = GetState(target, exclude, algo=algo)
+        state_hash = GetStateHash(current_state, algo)
 
         print(f"Current state hash: {state_hash}")
         print(f"Patch source state hash: {diff.get('source_state')}")
@@ -292,80 +349,108 @@ def ApplyPatch(target, patch_file, exclude=None):
         # Check if the current state matches the patch's source state
         if diff.get('source_state') != state_hash:
             print("Current state:", json.dumps(current_state, indent=2))
-            # print("Expected source state hash from patch:", diff.get('source_state'))
-            raise Exception("The current state of the target directory does not match the source state required by the patch.")
+            raise PatchVerificationError(
+                "The current state of the target directory does not match the source state required by the patch."
+            )
 
-        # --- Applying changes ---
-        print("Applying patch...")
+        # --- Applying changes (transactionally) ---
 
-        # 1. Deleting files
-        for filename in diff.get('removed', []):
-            path_to_remove = ClearPatch(os.path.join(target, filename))
-            if os.path.isfile(path_to_remove):
+        # Backup directory (outside the target tree) used for rollback.
+        target_parent = os.path.dirname(os.path.abspath(target)) or os.path.curdir
+        try:
+            backup_dir = tempfile.mkdtemp(prefix=".stateman-backup-", dir=target_parent)
+        except OSError:
+            backup_dir = tempfile.mkdtemp(prefix="stateman-backup-")
+
+        # (relative_path -> backup location) for files we replace/delete,
+        # and list of files we created (did not exist before).
+        backed_up = {}
+        created = []
+
+        def _rollback():
+            """Restore the target directory to its pre-patch state."""
+            for rel in created:
                 try:
-                    os.remove(path_to_remove)
-                    print(f"- Removed: {path_to_remove}")
-                except OSError as e:
-                    print(f"Warning: Could not remove file {path_to_remove}: {e}")
-            else:
-                 print(f"Warning: File to remove not found (already removed?): {path_to_remove}")
+                    os.remove(safe_join(target, rel))
+                except OSError:
+                    pass
+            for rel, backup_path in backed_up.items():
+                try:
+                    original = safe_join(target, rel)
+                    os.makedirs(os.path.dirname(original), exist_ok=True)
+                    shutil.move(backup_path, original)
+                except OSError:
+                    pass
+            shutil.rmtree(backup_dir, ignore_errors=True)
 
-        # 2. Extracting/Updating files (added and changed)
-        files_to_extract = diff.get('added', []) + diff.get('changed', [])
-        patch_md5_map = diff.get('md5', {})
+        try:
+            print("Applying patch...")
 
-        for filename in files_to_extract:
-            target_path = ClearPatch(os.path.join(target, filename))
-            target_file_dir = os.path.dirname(target_path)
+            # 1. Back up every file that will be deleted or replaced
+            for filename in removed + changed:
+                original = safe_join(target, filename)
+                if os.path.isfile(original):
+                    backup_path = os.path.join(backup_dir, ClearPatch(filename))
+                    os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+                    shutil.move(original, backup_path)
+                    backed_up[filename] = backup_path
 
-            # Create parent directories if they don't exist
-            Path(target_file_dir).mkdir(parents=True, exist_ok=True)
+            # 2. Extract and verify files (added and changed)
+            for filename in files_to_extract:
+                target_path = safe_join(target, filename)
+                target_file_dir = os.path.dirname(target_path)
+                Path(target_file_dir).mkdir(parents=True, exist_ok=True)
 
-            # Remove the old file if it exists (for changed files)
-            if filename in diff.get('changed', []) and os.path.exists(target_path):
-                 try:
-                    # Add a check to ensure it's a file, not a directory
-                    if os.path.isfile(target_path):
-                        os.remove(target_path)
-                    else:
-                        print(f"Warning: Expected file but found directory at {target_path}. Skipping removal.")
-                        continue # Skip this file
-                 except OSError as e:
-                    print(f"Warning: Could not remove existing file {target_path} before update: {e}")
-                    continue # Skip this file
-
-            try:
-                # Extract the file from the archive
-                patch.extract(filename, target)
-                action = "+" if filename in diff.get('added', []) else "*"
-                print(f"{action} Extracted: {target_path}")
-
-                # Verify the hash of the extracted file
-                extracted_hash = get_hash(target_path)
-                expected_hash = patch_md5_map.get(filename)
-
-                if not expected_hash:
-                     print(f"Warning: No expected hash found in patch metadata for {filename}. Skipping check.")
-                elif not extracted_hash:
-                     print(f"Warning: Could not calculate hash for extracted file {target_path} (likely deleted during process?). Skipping check.")
-                elif extracted_hash != expected_hash:
-                    # If hashes don't match, it's a serious problem
-                    raise AssertionError(
-                        f"Hash mismatch for extracted file {target_path}! "
-                        f"Expected {expected_hash}, got {extracted_hash}. Patch or extraction failed."
+                try:
+                    member = patch.getinfo(filename)
+                except KeyError:
+                    raise PatchVerificationError(
+                        f"File '{filename}' listed in patch metadata but not found in the archive."
                     )
 
-            except KeyError:
-                print(f"Warning: File '{filename}' listed in patch metadata but not found in the archive.")
-            except Exception as e:
-                print(f"Error extracting or verifying file {filename}: {e}")
-                # Decide whether to stop the whole process or just skip the file
-                # raise e # Uncomment to stop patch application on error
+                # Extract manually to the validated path (never trust arcname resolution)
+                with patch.open(member) as src, open(target_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst, _CHUNK_SIZE)
 
+                if filename not in backed_up:
+                    created.append(filename)
+
+                # Verify the hash of the extracted file
+                extracted_hash = get_hash(target_path, algo)
+                expected_hash = expected_hashes.get(filename)
+                if not expected_hash:
+                    raise PatchVerificationError(
+                        f"No expected hash found in patch metadata for {filename}."
+                    )
+                if extracted_hash != expected_hash:
+                    raise PatchVerificationError(
+                        f"Hash mismatch for extracted file {target_path}! "
+                        f"Expected {expected_hash}, got {extracted_hash}. Patch is corrupted."
+                    )
+
+                action = "+" if filename in added else "*"
+                print(f"{action} Extracted: {target_path}")
+
+            # 3. Delete removed files (already backed up in step 1)
+            for filename in removed:
+                if filename in backed_up:  # existed and was moved to backup - done
+                    print(f"- Removed: {safe_join(target, filename)}")
+                else:
+                    print(f"Warning: File to remove not found (already removed?): {filename}")
+
+            # 4. Final verification: state after patching must match target_state
+            final_state_hash = GetStateHash(GetState(target, exclude, algo=algo), algo)
+            if final_state_hash != diff.get('target_state'):
+                raise PatchVerificationError(
+                    f"Final state hash ({final_state_hash}) does not match patch target state hash "
+                    f"({diff.get('target_state')}). Rolling back."
+                )
+        except Exception:
+            _rollback()
+            print("Patch application failed. Changes rolled back, target directory restored.")
+            raise
+
+        # Success: drop the backup
+        shutil.rmtree(backup_dir, ignore_errors=True)
         print("Patch applied successfully.")
-        # Optional final check: hash of the state after patching should match target_state
-        final_state_hash = GetStateHash(GetState(target, exclude))
-        if final_state_hash != diff.get('target_state'):
-             print(f"Warning: Final state hash ({final_state_hash}) does not match patch target state hash ({diff.get('target_state')}). This might indicate issues during patching or with excluded files.")
-
         return True
