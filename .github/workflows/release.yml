@@ -1,0 +1,50 @@
+name: Release
+
+# Publishes to PyPI using Trusted Publishing (OIDC) with PEP 740
+# provenance attestations, so releases show "provenance" on PyPI.
+#
+# One-time setup on PyPI (project owner):
+#   https://pypi.org/manage/account/publishing/
+#     PyPI project name:      stateman
+#     Owner:                  vpuhoff
+#     Repository:             vpuhoff/stateman
+#     Workflow name:          release.yml
+#     Environment name:       pypi
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Required for PyPI Trusted Publishing (OIDC) and attestations
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Generate and upload PEP 740 provenance attestations
+          attestations: true
