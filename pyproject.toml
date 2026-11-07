@@ -1,6 +1,6 @@
 [project]
 name = "stateman"
-version = "2.0.0"
+version = "2.0.1"
 description = "This module provides tools to track changes in the content of a directory and create compact binary patches that can be used to synchronize another copy of that directory."
 readme = "README.md"
 license = { text = "MIT" }
