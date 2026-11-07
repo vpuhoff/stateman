@@ -387,6 +387,10 @@ def ApplyPatch(target, patch_file, exclude=None,
         backed_up = {}
         created = []
         total_extracted = 0
+        # Current umask, used to give extracted files the same permissions
+        # they would get from a plain open(path, "wb") (mkstemp uses 0600).
+        umask = os.umask(0)
+        os.umask(umask)
 
         def _rollback():
             """Restore the target directory to its pre-patch state."""
@@ -442,42 +446,57 @@ def ApplyPatch(target, patch_file, exclude=None,
                         f"({member.file_size} / {member.compress_size}), possible zip bomb."
                     )
 
-                # Extract manually to the validated path (never trust arcname
-                # resolution), enforcing the actual byte count while streaming.
-                written = 0
-                with patch.open(member) as src, open(target_path, "wb") as dst:
-                    while True:
-                        chunk = src.read(_CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        written += len(chunk)
-                        if written > max_member_size:
-                            raise PatchVerificationError(
-                                f"Archive member '{filename}' expanded beyond the "
-                                f"per-member limit of {max_member_size} bytes."
-                            )
-                        dst.write(chunk)
-                total_extracted += written
-                if total_extracted > max_total_size:
-                    raise PatchVerificationError(
-                        f"Patch expanded beyond the total size limit of {max_total_size} bytes."
-                    )
+                # Extract to a temporary file in the same directory, verify its
+                # hash, and only then atomically move it into place. A failure
+                # at any point (corrupted stream, hash mismatch) can never
+                # leave a partially written file at the target path (issue #4).
+                fd, tmp_path = tempfile.mkstemp(prefix=".stateman-tmp-", dir=target_file_dir)
+                os.close(fd)
+                try:
+                    written = 0
+                    with patch.open(member) as src, open(tmp_path, "wb") as dst:
+                        while True:
+                            chunk = src.read(_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            written += len(chunk)
+                            if written > max_member_size:
+                                raise PatchVerificationError(
+                                    f"Archive member '{filename}' expanded beyond the "
+                                    f"per-member limit of {max_member_size} bytes."
+                                )
+                            dst.write(chunk)
+                    total_extracted += written
+                    if total_extracted > max_total_size:
+                        raise PatchVerificationError(
+                            f"Patch expanded beyond the total size limit of {max_total_size} bytes."
+                        )
+
+                    # Verify the hash of the extracted file before moving it into place
+                    extracted_hash = get_hash(tmp_path, algo)
+                    expected_hash = expected_hashes.get(filename)
+                    if not expected_hash:
+                        raise PatchVerificationError(
+                            f"No expected hash found in patch metadata for {filename}."
+                        )
+                    if extracted_hash != expected_hash:
+                        raise PatchVerificationError(
+                            f"Hash mismatch for extracted file {target_path}! "
+                            f"Expected {expected_hash}, got {extracted_hash}. Patch is corrupted."
+                        )
+
+                    os.chmod(tmp_path, 0o666 & ~umask)  # mkstemp creates 0600
+                    os.replace(tmp_path, target_path)  # atomic on POSIX and Windows
+                finally:
+                    # Clean up the temp file if anything failed before the replace
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
 
                 if filename not in backed_up:
                     created.append(filename)
-
-                # Verify the hash of the extracted file
-                extracted_hash = get_hash(target_path, algo)
-                expected_hash = expected_hashes.get(filename)
-                if not expected_hash:
-                    raise PatchVerificationError(
-                        f"No expected hash found in patch metadata for {filename}."
-                    )
-                if extracted_hash != expected_hash:
-                    raise PatchVerificationError(
-                        f"Hash mismatch for extracted file {target_path}! "
-                        f"Expected {expected_hash}, got {extracted_hash}. Patch is corrupted."
-                    )
 
                 action = "+" if filename in added else "*"
                 print(f"{action} Extracted: {target_path}")

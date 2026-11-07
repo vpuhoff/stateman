@@ -444,3 +444,26 @@ def test_zip_bomb_compression_ratio_limit(tmp_path):
 
     # С дефолтными лимитами тот же патч применяется нормально
     assert ApplyPatch(str(target_dir), str(patch_file)) is True
+
+def test_partial_write_leaves_no_file(tmp_path):
+    """Issue #4: сбой посреди распаковки не оставляет частичный файл."""
+    source_dir, target_dir, patch_file = setup_test_dirs(tmp_path)
+    write_file(source_dir / "new.txt", "A" * 100000)
+    state2 = GetState(str(source_dir))
+    diff = GetDiff({}, state2)
+    CreatePatch(str(source_dir), str(patch_file), diff)
+
+    # Портим один байт в середине сжатого потока new.txt
+    with ZipFile(patch_file) as z:
+        info = z.getinfo("new.txt")
+        pos = info.header_offset + 30 + len("new.txt") + 100
+    raw = patch_file.read_bytes()
+    patch_file.write_bytes(raw[:pos] + bytes([raw[pos] ^ 0xFF]) + raw[pos + 1:])
+
+    with pytest.raises(Exception):
+        ApplyPatch(str(target_dir), str(patch_file))
+
+    # Ни частичного файла, ни временных файлов после отката
+    assert not (target_dir / "new.txt").exists()
+    assert list(target_dir.rglob(".stateman-tmp-*")) == []
+    assert GetState(str(target_dir)) == {}

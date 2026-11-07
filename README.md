@@ -44,6 +44,9 @@ Starting with v2.0, patches are safe to apply even when they come from an untrus
 
 ## Changelog
 
+### 2.0.1
+* Fixed #4: a failure mid-extraction (corrupted ZIP stream, hash mismatch) could leave a partially written file in the target directory after rollback. Files are now extracted to a temporary file, hash-verified, and atomically moved into place (`os.replace`), so a partial file can never appear at the target path.
+
 ### 2.0.0
 * **Breaking:** `ApplyPatch` now raises `PatchVerificationError` when the final state hash does not match the patch target state (previously it printed a warning and returned `True`), and when a file extracted from the patch fails its hash check.
 * **Breaking:** default hash algorithm switched from MD5 to SHA-256. Legacy v1 (MD5) patches are still applied correctly.
