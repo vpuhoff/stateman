@@ -40,6 +40,7 @@ Starting with v2.0, patches are safe to apply even when they come from an untrus
 * **Per-file integrity verification** — each extracted file is checked against its expected hash before proceeding.
 * **Transactional apply with rollback** — if any step fails (corrupted archive member, hash mismatch, final state mismatch), all changes are rolled back and the target directory is restored to its original state. `ApplyPatch` raises an exception instead of silently returning `True`.
 * **Compressed patches** — archives are written with `ZIP_DEFLATED` instead of stored.
+* **Zip-bomb protection** — each archive member is checked against its declared uncompressed size, compression ratio (default max 1000x), a per-member cap (4 GiB) and a cumulative cap (16 GiB), both before and during streaming extraction. All limits are overridable via `ApplyPatch(...)` arguments.
 
 ## Changelog
 
@@ -49,6 +50,7 @@ Starting with v2.0, patches are safe to apply even when they come from an untrus
 * Path traversal protection for all paths taken from patch metadata (`UnsafePatchPathError`).
 * `ApplyPatch` is transactional: failed patches are rolled back automatically.
 * Patches are compressed with DEFLATE.
+* Zip-bomb protection: per-member size cap, cumulative size cap and compression-ratio limit (configurable via `ApplyPatch` arguments).
 * New exceptions: `PatchError`, `PatchVerificationError`, `UnsafePatchPathError`, `PatchFormatError`.
 * Removed the unused `CheckGitRepo` helper and the stray `keylocker` console script from `pyproject.toml`.
 * CI matrix: Linux + Windows, Python 3.9–3.13.

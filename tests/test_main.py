@@ -414,3 +414,33 @@ def test_create_patch_missing_file(tmp_path):
     diff = {"added": ["ghost.txt"], "changed": [], "removed": []}
     with pytest.raises(Exception, match="ghost.txt"):
         CreatePatch(str(source_dir), str(patch_file), diff)
+
+def test_zip_bomb_member_size_limit(tmp_path):
+    """Файл в патче больше лимита max_member_size отклоняется, каталог не трогается."""
+    source_dir, target_dir, patch_file = setup_test_dirs(tmp_path)
+    write_file(source_dir / "big.txt", "x" * 1000)
+    state2 = GetState(str(source_dir))
+    diff = GetDiff({}, state2)
+    CreatePatch(str(source_dir), str(patch_file), diff)
+
+    # Лимит меньше реального размера файла
+    with pytest.raises(PatchVerificationError, match="per-member limit"):
+        ApplyPatch(str(target_dir), str(patch_file), max_member_size=100)
+
+    # Каталог не изменён
+    assert not (target_dir / "big.txt").exists()
+
+def test_zip_bomb_compression_ratio_limit(tmp_path):
+    """Чрезмерный коэффициент сжатия отклоняется как возможная zip-бомба."""
+    source_dir, target_dir, patch_file = setup_test_dirs(tmp_path)
+    write_file(source_dir / "compressed.txt", "compressible " * 500)
+    state2 = GetState(str(source_dir))
+    diff = GetDiff({}, state2)
+    CreatePatch(str(source_dir), str(patch_file), diff)
+
+    # ratio=1 запрещает любое сжатие — файл точно сжат больше чем в 1 раз
+    with pytest.raises(PatchVerificationError, match="compression ratio"):
+        ApplyPatch(str(target_dir), str(patch_file), max_compression_ratio=1)
+
+    # С дефолтными лимитами тот же патч применяется нормально
+    assert ApplyPatch(str(target_dir), str(patch_file)) is True

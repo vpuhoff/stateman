@@ -15,6 +15,13 @@ SUPPORTED_HASH_ALGOS = ("sha256", "md5")
 # Size of chunks used when hashing / copying files.
 _CHUNK_SIZE = 64 * 1024
 
+# Zip-bomb protection defaults for ApplyPatch (can be overridden per call):
+# a single member may not declare/expand to more than 4 GiB, all members
+# together not more than 16 GiB, and the compression ratio is capped at 1000x.
+DEFAULT_MAX_MEMBER_SIZE = 4 * 1024 ** 3
+DEFAULT_MAX_TOTAL_SIZE = 16 * 1024 ** 3
+DEFAULT_MAX_COMPRESSION_RATIO = 1000
+
 # Define the path separator for the current OS for unification
 sep = os.path.sep
 
@@ -258,7 +265,10 @@ def CreatePatch(source_folder, patch_file, diff):
             z.write(source_path, arcname=file)
 
 
-def ApplyPatch(target, patch_file, exclude=None):
+def ApplyPatch(target, patch_file, exclude=None,
+               max_member_size=DEFAULT_MAX_MEMBER_SIZE,
+               max_total_size=DEFAULT_MAX_TOTAL_SIZE,
+               max_compression_ratio=DEFAULT_MAX_COMPRESSION_RATIO):
     """Applies a patch to the target directory.
 
     Verifies that the current state of the target directory matches the source
@@ -271,6 +281,10 @@ def ApplyPatch(target, patch_file, exclude=None):
     are rolled back and an exception is raised. The target directory is left
     in its original state.
 
+    Zip-bomb protection: each archive member is checked against the declared
+    uncompressed size, the compression ratio, a per-member cap and a
+    cumulative cap before and during extraction.
+
     Supports both the current v2 patches (SHA-256, 'hashes' metadata key)
     and legacy v1 patches (MD5, 'md5' metadata key).
 
@@ -279,6 +293,12 @@ def ApplyPatch(target, patch_file, exclude=None):
         patch_file (str): Path to the ZIP patch file.
         exclude (str, optional): Pattern to exclude files when checking the
                                  current state of the target directory.
+        max_member_size (int): Maximum uncompressed size of a single archive
+                               member in bytes (default 4 GiB).
+        max_total_size (int): Maximum total uncompressed size of all members
+                              extracted by this patch in bytes (default 16 GiB).
+        max_compression_ratio (int): Maximum allowed compression ratio of an
+                                     archive member (default 1000).
 
     Returns:
         bool: True if the patch was successfully applied or if the directory
@@ -366,6 +386,7 @@ def ApplyPatch(target, patch_file, exclude=None):
         # and list of files we created (did not exist before).
         backed_up = {}
         created = []
+        total_extracted = 0
 
         def _rollback():
             """Restore the target directory to its pre-patch state."""
@@ -408,9 +429,39 @@ def ApplyPatch(target, patch_file, exclude=None):
                         f"File '{filename}' listed in patch metadata but not found in the archive."
                     )
 
-                # Extract manually to the validated path (never trust arcname resolution)
+                # Zip-bomb guards, checked against the (untrusted) declared
+                # sizes before any decompression happens.
+                if member.file_size > max_member_size:
+                    raise PatchVerificationError(
+                        f"Archive member '{filename}' declares {member.file_size} bytes, "
+                        f"which exceeds the per-member limit of {max_member_size}."
+                    )
+                if member.compress_size and member.file_size > member.compress_size * max_compression_ratio:
+                    raise PatchVerificationError(
+                        f"Archive member '{filename}' has a suspicious compression ratio "
+                        f"({member.file_size} / {member.compress_size}), possible zip bomb."
+                    )
+
+                # Extract manually to the validated path (never trust arcname
+                # resolution), enforcing the actual byte count while streaming.
+                written = 0
                 with patch.open(member) as src, open(target_path, "wb") as dst:
-                    shutil.copyfileobj(src, dst, _CHUNK_SIZE)
+                    while True:
+                        chunk = src.read(_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > max_member_size:
+                            raise PatchVerificationError(
+                                f"Archive member '{filename}' expanded beyond the "
+                                f"per-member limit of {max_member_size} bytes."
+                            )
+                        dst.write(chunk)
+                total_extracted += written
+                if total_extracted > max_total_size:
+                    raise PatchVerificationError(
+                        f"Patch expanded beyond the total size limit of {max_total_size} bytes."
+                    )
 
                 if filename not in backed_up:
                     created.append(filename)
